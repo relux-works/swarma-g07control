@@ -371,6 +371,68 @@ func TestEvidenceRefusals(t *testing.T) {
 	}
 }
 
+func TestEventTimestampRefusals(t *testing.T) {
+	const issuedAt int64 = 1700000000
+	now := time.Unix(issuedAt+2, 0)
+	for _, tc := range []struct {
+		name    string
+		invalid int64
+		valid   int64
+	}{
+		{"before_grant_issuance", issuedAt*1000 - 1, issuedAt * 1000},
+		{"future_event_with_active_grant", now.UnixMilli() + 1, now.UnixMilli()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, side := range []struct {
+				name  string
+				stamp int64
+				valid bool
+			}{
+				{"invalid", tc.invalid, false},
+				{"valid_neighbor", tc.valid, true},
+			} {
+				t.Run(side.name, func(t *testing.T) {
+					x := newFixture(t)
+					g := x.grant
+					g.IssuedAt = issuedAt
+					g.StartNoLaterThan = issuedAt + 300
+					c := x.open()
+					c.now = func() time.Time { return now }
+					if e := c.checkGrant(g); e != nil {
+						t.Fatal("timestamp case requires an otherwise valid grant", code(e))
+					}
+					// Preserve the canonical grant and every other outer field.
+					// Each side gets a fresh store; only its event timestamp differs.
+					var event map[string]json.RawMessage
+					if e := json.Unmarshal(x.event(g), &event); e != nil {
+						t.Fatal(e)
+					}
+					event["origin_server_ts"] = mustJSON(t, side.stamp)
+					x.setBody(mustJSON(t, event))
+					r, e := consume(t, c)
+					if x.badRequest.Load() || x.requests.Load() != 1 {
+						t.Fatal("timestamp case must reach the authenticated fixture endpoint")
+					}
+					if !side.valid {
+						if code(e) != "AUTH_REFUSED" || r != (Receipt{}) {
+							t.Fatalf("invalid event timestamp: outcome=%s code=%s", r.Outcome, code(e))
+						}
+						noClaim(t, x)
+						return
+					}
+					if e != nil || r.Outcome != "NEWLY_CONSUMED" || r.RequestSHA256 != digest(mustJSON(t, g)) {
+						t.Fatalf("valid timestamp neighbor: outcome=%s code=%s", r.Outcome, code(e))
+					}
+					b, e := os.ReadFile(filepath.Join(x.policy.Store.Path, claimName(x.policy.Slot)))
+					if e != nil || digest(b) != r.RecordSHA256 {
+						t.Fatal("valid timestamp neighbor must persist its claim")
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestHomeserverReserialization(t *testing.T) {
 	x := newFixture(t)
 	c := x.open()
